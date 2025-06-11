@@ -10,7 +10,7 @@ function check_docker() {
     if ! command -v docker >/dev/null 2>&1; then
         echo "检测到未安装 Docker，正在安装..."
         apt update
-        apt install -y apt-transport-https ca-certificates curl software-properties-common
+        apt install -y apt-transport-https ca-certificates curl software-properties-common git build-essential pkg-config libssl-dev
         curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add -
         add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"
         apt update
@@ -20,32 +20,82 @@ function check_docker() {
     fi
 }
 
-# 构建docker镜像函数
+# 构建docker镜像函数（源码编译）
 function build_image() {
     WORKDIR=$(mktemp -d)
     cd "$WORKDIR"
 
     cat > Dockerfile <<EOF
-FROM ubuntu:22.04
+FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
+ENV PROVER_ID_FILE=/root/.nexus/node-id
 
 RUN apt-get update && apt-get install -y \\
     curl \\
     screen \\
     bash \\
-    ca-certificates \\
+    git \\
+    build-essential \\
+    pkg-config \\
+    libssl-dev \\
     && rm -rf /var/lib/apt/lists/*
 
-# 下载并安装 nexus-network 二进制文件
-RUN curl -L https://github.com/nexus-xyz/nexus-cli/releases/latest/download/nexus-network-x86_64-unknown-linux-gnu.tar.gz -o nexus.tar.gz && \\
-    tar -xzf nexus.tar.gz && \\
-    mv nexus-network /usr/local/bin/nexus-network && \\
-    chmod +x /usr/local/bin/nexus-network && \\
-    rm -rf nexus.tar.gz
+# 安装 Rust
+RUN curl https://sh.rustup.rs -sSf | sh -s -- -y
+ENV PATH="/root/.cargo/bin:\$PATH"
 
-WORKDIR /root
+# 编译 nexus-network
+RUN git clone https://github.com/nexus-xyz/nexus-cli.git /opt/nexus-cli \\
+    && cd /opt/nexus-cli/clients/cli \\
+    && /root/.cargo/bin/cargo build --release
 
+RUN cp /opt/nexus-cli/target/release/nexus-network /usr/local/bin/nexus-network \\
+    && chmod +x /usr/local/bin/nexus-network
+
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]
+EOF
+
+    cat > entrypoint.sh <<'EOF'
+#!/bin/bash
+set -e
+
+PROVER_ID_FILE="/root/.nexus/node-id"
+
+if [ -z "$NODE_ID" ]; then
+    echo "错误：环境变量 NODE_ID 未设置"
+    exit 1
+fi
+
+echo "$NODE_ID" > "$PROVER_ID_FILE"
+echo "使用的 node-id: $NODE_ID"
+
+if ! command -v nexus-network >/dev/null 2>&1; then
+    echo "错误：nexus-network 未安装或不可用"
+    exit 1
+fi
+
+screen -S nexus -X quit >/dev/null 2>&1 || true
+
+echo "启动 nexus-network 节点..."
+screen -dmS nexus bash -c "nexus-network start --node-id $NODE_ID &>> /root/nexus.log"
+
+sleep 3
+
+if screen -list | grep -q "nexus"; then
+    echo "节点已在后台启动。"
+    echo "日志文件：/root/nexus.log"
+    echo "可以使用 docker logs 查看日志"
+else
+    echo "节点启动失败，请检查日志。"
+    cat /root/nexus.log
+    exit 1
+fi
+
+tail -f /root/nexus.log
 EOF
 
     docker build -t "$IMAGE_NAME" .
@@ -54,25 +104,22 @@ EOF
     rm -rf "$WORKDIR"
 }
 
-# 启动容器（运行时输入 node-id）
+# 启动容器（挂载宿主机日志文件）
 function run_container() {
     if docker ps -a --format '{{.Names}}' | grep -qw "$CONTAINER_NAME"; then
         echo "检测到旧容器 $CONTAINER_NAME，先删除..."
         docker rm -f "$CONTAINER_NAME"
     fi
 
-    read -rp "请输入你的 node-id: " NODE_ID
-    if [ -z "$NODE_ID" ]; then
-        echo "node-id 不能为空，取消启动。"
-        return
+    # 确保宿主机日志文件存在并有写权限
+    if [ ! -f "$LOG_FILE" ]; then
+        touch "$LOG_FILE"
+        chmod 644 "$LOG_FILE"
     fi
 
-    docker run -d --name "$CONTAINER_NAME" --restart unless-stopped "$IMAGE_NAME" \
-        nexus-network run --node-id "$NODE_ID"
-
+    # 传入环境变量 NODE_ID 到容器
+    docker run -d --name "$CONTAINER_NAME" -v "$LOG_FILE":/root/nexus.log -e NODE_ID="$NODE_ID" "$IMAGE_NAME"
     echo "容器已启动！"
-    echo "使用以下命令查看日志："
-    echo "  docker logs -f $CONTAINER_NAME"
 }
 
 # 停止并卸载容器和镜像、删除日志
@@ -111,7 +158,13 @@ while true; do
     case $choice in
         1)
             check_docker
-            echo "开始构建镜像..."
+            read -rp "请输入您的 node-id: " NODE_ID
+            if [ -z "$NODE_ID" ]; then
+                echo "node-id 不能为空，请重新选择。"
+                read -p "按任意键继续"
+                continue
+            fi
+            echo "开始构建镜像并启动容器..."
             build_image
             run_container
             read -p "按任意键返回菜单"

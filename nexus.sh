@@ -20,26 +20,37 @@ function check_docker() {
     fi
 }
 
-# 构建docker镜像函数
+# 构建 docker 镜像
 function build_image() {
     WORKDIR=$(mktemp -d)
     cd "$WORKDIR"
 
-    cat > Dockerfile <<EOF
-FROM ubuntu:24.04
+    cat > Dockerfile <<'EOF'
+FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PROVER_ID_FILE=/root/.nexus/node-id
 
-RUN apt-get update && apt-get install -y \\
-    curl \\
-    screen \\
-    bash \\
+RUN apt-get update && apt-get install -y \
+    curl \
+    screen \
+    bash \
+    git \
+    pkg-config \
+    libssl-dev \
+    build-essential \
+    ca-certificates \
+    sudo \
     && rm -rf /var/lib/apt/lists/*
 
-RUN curl -sSL https://cli.nexus.xyz/ | sh
+RUN curl https://sh.rustup.rs -sSf | bash -s -- -y
+ENV PATH="/root/.cargo/bin:$PATH"
 
-RUN ln -sf /root/.nexus/bin/nexus-network /usr/local/bin/nexus-network
+RUN git clone https://github.com/nexus-xyz/nexus-cli.git && \
+    cd nexus-cli/clients/cli && \
+    cargo build --release && \
+    cp target/release/nexus-network /usr/local/bin/nexus-network && \
+    chmod +x /usr/local/bin/nexus-network
 
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
@@ -47,13 +58,13 @@ RUN chmod +x /entrypoint.sh
 ENTRYPOINT ["/entrypoint.sh"]
 EOF
 
-    cat > entrypoint.sh <<EOF
+    cat > entrypoint.sh <<'EOF'
 #!/bin/bash
 set -e
 
 PROVER_ID_FILE="/root/.nexus/node-id"
 
-echo "$NODE_ID" > "\$PROVER_ID_FILE"
+echo "$NODE_ID" > "$PROVER_ID_FILE"
 echo "使用的 node-id: $NODE_ID"
 
 if ! command -v nexus-network >/dev/null 2>&1; then
@@ -71,7 +82,7 @@ sleep 3
 if screen -list | grep -q "nexus"; then
     echo "节点已在后台启动。"
     echo "日志文件：/root/nexus.log"
-    echo "可以使用 docker logs $CONTAINER_NAME 查看日志"
+    echo "可以使用 docker logs \$CONTAINER_NAME 查看日志"
 else
     echo "节点启动失败，请检查日志。"
     cat /root/nexus.log
@@ -87,24 +98,23 @@ EOF
     rm -rf "$WORKDIR"
 }
 
-# 启动容器（挂载宿主机日志文件）
+# 启动容器
 function run_container() {
     if docker ps -a --format '{{.Names}}' | grep -qw "$CONTAINER_NAME"; then
         echo "检测到旧容器 $CONTAINER_NAME，先删除..."
         docker rm -f "$CONTAINER_NAME"
     fi
 
-    # 确保宿主机日志文件存在并有写权限
     if [ ! -f "$LOG_FILE" ]; then
         touch "$LOG_FILE"
         chmod 644 "$LOG_FILE"
     fi
 
-    docker run -d --name "$CONTAINER_NAME" -v "$LOG_FILE":/root/nexus.log "$IMAGE_NAME"
+    docker run -d --name "$CONTAINER_NAME" -e NODE_ID="$NODE_ID" -v "$LOG_FILE":/root/nexus.log "$IMAGE_NAME"
     echo "容器已启动！"
 }
 
-# 停止并卸载容器和镜像、删除日志
+# 卸载容器和镜像
 function uninstall_node() {
     echo "停止并删除容器 $CONTAINER_NAME..."
     docker rm -f "$CONTAINER_NAME" 2>/dev/null || echo "容器不存在或已停止"

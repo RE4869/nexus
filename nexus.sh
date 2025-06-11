@@ -1,181 +1,84 @@
 #!/bin/bash
+
 set -e
 
+IMAGE_NAME="nexus-node"
 CONTAINER_NAME="nexus-node"
-IMAGE_NAME="nexus-node:latest"
-LOG_FILE="/root/nexus.log"
+DOCKERFILE_URL="https://raw.githubusercontent.com/nexus-xyz/nexus-cli/main/Dockerfile"
 
-# 检查 Docker 是否安装
-function check_docker() {
-    if ! command -v docker >/dev/null 2>&1; then
-        echo "检测到未安装 Docker，正在安装..."
-        apt update
-        apt install -y apt-transport-https ca-certificates curl software-properties-common
-        curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add -
-        add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"
-        apt update
-        apt install -y docker-ce
-        systemctl enable docker
-        systemctl start docker
-    fi
+install_docker() {
+    echo "🚀 安装 Docker 中..."
+    curl -fsSL https://get.docker.com | bash
+    echo "✅ Docker 安装完成"
 }
 
-# 构建 Docker 镜像
-function build_image() {
-    WORKDIR=$(mktemp -d)
-    cd "$WORKDIR"
+build_image() {
+    echo "🔨 正在构建 Docker 镜像..."
 
     cat > Dockerfile <<EOF
 FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
-ENV PROVER_ID_FILE=/root/.nexus/node-id
+RUN apt-get update && apt-get install -y curl git screen bash ca-certificates build-essential pkg-config libssl-dev clang cmake \
+    && curl https://sh.rustup.rs -sSf | bash -s -- -y \
+    && /root/.cargo/bin/rustc --version
 
-RUN apt-get update && apt-get install -y \\
-    curl \\
-    screen \\
-    bash \\
-    && rm -rf /var/lib/apt/lists/*
+ENV PATH="/root/.cargo/bin:\$PATH"
 
-RUN curl -sSL https://cli.nexus.xyz/ | sh
+RUN git clone https://github.com/nexus-xyz/nexus-cli.git && \
+    cd nexus-cli && \
+    cargo build --release && \
+    cp target/release/nexus-network /usr/local/bin/ && \
+    chmod +x /usr/local/bin/nexus-network && \
+    cd .. && rm -rf nexus-cli
 
-RUN ln -sf /root/.nexus/bin/nexus-network /usr/local/bin/nexus-network
-
-COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
-
-ENTRYPOINT ["/entrypoint.sh"]
+WORKDIR /root
 EOF
 
-    cat > entrypoint.sh <<EOF
-#!/bin/bash
-set -e
-
-echo "\$NODE_ID" > /root/.nexus/node-id
-echo "使用的 node-id: \$NODE_ID"
-
-if ! command -v nexus-network >/dev/null 2>&1; then
-    echo "错误：nexus-network 未安装或不可用"
-    exit 1
-fi
-
-screen -S nexus -X quit >/dev/null 2>&1 || true
-
-screen -dmS nexus bash -c "nexus-network start --node-id \$NODE_ID &>> /root/nexus.log"
-
-sleep 3
-
-if screen -list | grep -q "nexus"; then
-    echo "节点已在后台启动。"
-else
-    echo "节点启动失败，请检查日志："
-    cat /root/nexus.log
-    exit 1
-fi
-
-tail -f /root/nexus.log
-EOF
-
-    docker build -t "$IMAGE_NAME" .
-
-    cd - >/dev/null
-    rm -rf "$WORKDIR"
+    docker build -t $IMAGE_NAME .
+    rm -f Dockerfile
+    echo "✅ 镜像构建完成：$IMAGE_NAME"
 }
 
-# 启动容器
-function run_container() {
-    if docker ps -a --format '{{.Names}}' | grep -qw "$CONTAINER_NAME"; then
-        echo "检测到旧容器 $CONTAINER_NAME，正在删除..."
-        docker rm -f "$CONTAINER_NAME"
-    fi
+run_container() {
+    echo "🟢 启动 Nexus 节点容器..."
 
-    [ ! -f "$LOG_FILE" ] && touch "$LOG_FILE" && chmod 644 "$LOG_FILE"
+    read -p "请输入你的 node-id: " NODE_ID
+    docker run -d --name $CONTAINER_NAME --restart unless-stopped $IMAGE_NAME nexus-network run --node-id $NODE_ID
 
-    docker run -d \
-        --name "$CONTAINER_NAME" \
-        -e NODE_ID="$NODE_ID" \
-        -v "$LOG_FILE":/root/nexus.log \
-        "$IMAGE_NAME"
-
-    sleep 2
-    if docker logs "$CONTAINER_NAME" | grep -q "节点已在后台启动"; then
-        echo "节点已成功启动，日志路径：$LOG_FILE"
-    else
-        echo "容器启动失败，日志如下："
-        docker logs "$CONTAINER_NAME"
-    fi
+    echo "✅ 容器已启动，使用以下命令查看日志："
+    echo "   docker logs -f $CONTAINER_NAME"
 }
 
-# 卸载函数
-function uninstall_node() {
-    echo "停止并删除容器 $CONTAINER_NAME..."
-    docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
-
-    echo "删除镜像 $IMAGE_NAME..."
-    docker rmi "$IMAGE_NAME" 2>/dev/null || true
-
-    [ -f "$LOG_FILE" ] && rm -f "$LOG_FILE"
-
-    echo "节点已完全卸载。"
+show_logs() {
+    docker logs -f $CONTAINER_NAME
 }
 
-# 主菜单
-while true; do
-    clear
-    echo "脚本由哈哈哈哈编写，推特 @ferdie_jhovie，免费开源，请勿相信收费"
-    echo "========== Nexus 节点管理 =========="
-    echo "1. 安装并启动节点"
-    echo "2. 显示节点 ID"
-    echo "3. 停止并卸载节点"
-    echo "4. 查看节点日志"
-    echo "5. 退出"
-    echo "==================================="
+show_node_id() {
+    echo "📍 当前容器命令:"
+    docker exec $CONTAINER_NAME ps -ef | grep nexus-network
+}
 
-    read -rp "请输入选项(1-5): " choice
+menu() {
+    while true; do
+        echo -e "\n========== Nexus 节点管理 =========="
+        echo "1. 安装 Docker"
+        echo "2. 构建镜像"
+        echo "3. 运行容器"
+        echo "4. 查看容器日志"
+        echo "5. 显示容器运行参数"
+        echo "6. 退出"
+        read -p "请输入选项 [1-6]: " choice
+        case "$choice" in
+            1) install_docker ;;
+            2) build_image ;;
+            3) run_container ;;
+            4) show_logs ;;
+            5) show_node_id ;;
+            6) exit 0 ;;
+            *) echo "无效选项，请重新输入" ;;
+        esac
+    done
+}
 
-    case $choice in
-        1)
-            check_docker
-            read -rp "请输入您的 node-id: " NODE_ID
-            if [ -z "$NODE_ID" ]; then
-                echo "node-id 不能为空，请重新选择。"
-                read -p "按任意键继续"
-                continue
-            fi
-            echo "开始构建镜像并启动容器..."
-            build_image
-            run_container
-            read -p "按任意键返回菜单"
-            ;;
-        2)
-            if docker ps -a --format '{{.Names}}' | grep -qw "$CONTAINER_NAME"; then
-                echo "节点 ID:"
-                docker exec "$CONTAINER_NAME" cat /root/.nexus/node-id || echo "无法读取节点 ID"
-            else
-                echo "容器未运行，请先安装并启动节点（选项1）"
-            fi
-            read -p "按任意键返回菜单"
-            ;;
-        3)
-            uninstall_node
-            read -p "按任意键返回菜单"
-            ;;
-        4)
-            if docker ps --format '{{.Names}}' | grep -qw "$CONTAINER_NAME"; then
-                echo "查看日志，按 Ctrl+C 退出日志查看"
-                docker logs -f "$CONTAINER_NAME"
-            else
-                echo "容器未运行，请先安装并启动节点（选项1）"
-                read -p "按任意键返回菜单"
-            fi
-            ;;
-        5)
-            echo "退出脚本。"
-            exit 0
-            ;;
-        *)
-            echo "无效选项，请重新输入。"
-            read -p "按任意键返回菜单"
-            ;;
-    esac
-done
+menu

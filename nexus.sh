@@ -25,32 +25,21 @@ function build_image() {
     WORKDIR=$(mktemp -d)
     cd "$WORKDIR"
 
-    cat > Dockerfile <<'EOF'
+    cat > Dockerfile <<EOF
 FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PROVER_ID_FILE=/root/.nexus/node-id
 
-RUN apt-get update && apt-get install -y \
-    curl \
-    screen \
-    bash \
-    git \
-    pkg-config \
-    libssl-dev \
-    build-essential \
-    ca-certificates \
-    sudo \
+RUN apt-get update && apt-get install -y \\
+    curl \\
+    screen \\
+    bash \\
     && rm -rf /var/lib/apt/lists/*
 
-RUN curl https://sh.rustup.rs -sSf | bash -s -- -y
-ENV PATH="/root/.cargo/bin:$PATH"
+RUN curl -sSL https://cli.nexus.xyz/ | sh || true
 
-RUN git clone https://github.com/nexus-xyz/nexus-cli.git && \
-    cd nexus-cli/clients/cli && \
-    cargo build --release && \
-    cp target/release/nexus-network /usr/local/bin/nexus-network && \
-    chmod +x /usr/local/bin/nexus-network
+RUN ln -sf /root/.nexus/bin/nexus-network /usr/local/bin/nexus-network
 
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
@@ -58,14 +47,16 @@ RUN chmod +x /entrypoint.sh
 ENTRYPOINT ["/entrypoint.sh"]
 EOF
 
-    cat > entrypoint.sh <<'EOF'
+    cat > entrypoint.sh <<EOF
 #!/bin/bash
 set -e
 
 PROVER_ID_FILE="/root/.nexus/node-id"
 
-echo "$NODE_ID" > "$PROVER_ID_FILE"
-echo "使用的 node-id: $NODE_ID"
+mkdir -p /root/.nexus
+
+echo "$NODE_ID" > "\$PROVER_ID_FILE"
+echo "使用的 node-id: \$NODE_ID"
 
 if ! command -v nexus-network >/dev/null 2>&1; then
     echo "错误：nexus-network 未安装或不可用"
@@ -75,7 +66,7 @@ fi
 screen -S nexus -X quit >/dev/null 2>&1 || true
 
 echo "启动 nexus-network 节点..."
-screen -dmS nexus bash -c "nexus-network start --node-id $NODE_ID &>> /root/nexus.log"
+screen -dmS nexus bash -c "nexus-network start --node-id \$NODE_ID &>> /root/nexus.log"
 
 sleep 3
 
@@ -114,7 +105,7 @@ function run_container() {
     echo "容器已启动！"
 }
 
-# 卸载容器和镜像
+# 卸载节点
 function uninstall_node() {
     echo "停止并删除容器 $CONTAINER_NAME..."
     docker rm -f "$CONTAINER_NAME" 2>/dev/null || echo "容器不存在或已停止"
@@ -135,8 +126,8 @@ function uninstall_node() {
 # 主菜单
 while true; do
     clear
-    echo "脚本由哈哈哈哈编写，推特 @ferdie_jhovie，免费开源，请勿相信收费"
-    echo "如有问题，可联系推特，仅此只有一个号"
+    echo "脚本由 RE4869 编写，免费开源，请勿相信收费"
+    echo "如有问题可联系推特 @ferdie_jhovie，仅此只有一个号"
     echo "========== Nexus 节点管理 =========="
     echo "1. 安装并启动节点"
     echo "2. 显示节点 ID"

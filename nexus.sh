@@ -1,28 +1,45 @@
 #!/bin/bash
-
 set -e
 
-APP_NAME="nexus-node"
-IMAGE_NAME="nexus-node:latest"
 CONTAINER_NAME="nexus-node"
+IMAGE_NAME="nexus-node:latest"
+LOG_FILE="/root/nexus.log"
 
-# 创建 Dockerfile
-cat > Dockerfile <<'EOF'
+# 检查 Docker 是否安装
+function check_docker() {
+    if ! command -v docker >/dev/null 2>&1; then
+        echo "检测到未安装 Docker，正在安装..."
+        apt update
+        apt install -y apt-transport-https ca-certificates curl software-properties-common
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add -
+        add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"
+        apt update
+        apt install -y docker-ce
+        systemctl enable docker
+        systemctl start docker
+    fi
+}
+
+# 构建 Docker 镜像
+function build_image() {
+    WORKDIR=$(mktemp -d)
+    cd "$WORKDIR"
+
+    cat > Dockerfile <<EOF
 FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PROVER_ID_FILE=/root/.nexus/node-id
 
-RUN apt-get update && apt-get install -y \
-    curl screen bash ca-certificates && \
-    rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y \\
+    curl \\
+    screen \\
+    bash \\
+    && rm -rf /var/lib/apt/lists/*
 
-RUN curl -L https://github.com/nexus-xyz/nexus-cli/releases/latest/download/nexus-network-x86_64-unknown-linux-gnu.tar.gz \
-    -o nexus.tar.gz && \
-    tar -xzf nexus.tar.gz && \
-    mv nexus-network /usr/local/bin/nexus-network && \
-    chmod +x /usr/local/bin/nexus-network && \
-    rm -rf nexus.tar.gz
+RUN curl -sSL https://cli.nexus.xyz/ | sh
+
+RUN ln -sf /root/.nexus/bin/nexus-network /usr/local/bin/nexus-network
 
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
@@ -30,49 +47,135 @@ RUN chmod +x /entrypoint.sh
 ENTRYPOINT ["/entrypoint.sh"]
 EOF
 
-# 创建 entrypoint.sh
-cat > entrypoint.sh <<'EOF'
+    cat > entrypoint.sh <<EOF
 #!/bin/bash
-
 set -e
 
-mkdir -p /root/.nexus
+echo "\$NODE_ID" > /root/.nexus/node-id
+echo "使用的 node-id: \$NODE_ID"
 
-if [ ! -f "$PROVER_ID_FILE" ]; then
-    node_id=$(shuf -i 1000000-9999999 -n 1)
-    echo "$node_id" > "$PROVER_ID_FILE"
-    echo "生成新的 node-id: $node_id"
-else
-    node_id=$(cat "$PROVER_ID_FILE")
-    echo "使用的 node-id: $node_id"
-fi
-
-if ! command -v nexus-network &> /dev/null; then
+if ! command -v nexus-network >/dev/null 2>&1; then
     echo "错误：nexus-network 未安装或不可用"
     exit 1
 fi
 
-nexus-network \
-    --node-id "$node_id" \
-    --validator-endpoint "https://validators.nexus.xyz" \
-    --chain-id "celestia" \
-    --log-level "info"
-EOF
+screen -S nexus -X quit >/dev/null 2>&1 || true
 
-# 构建镜像
-echo "🔨 正在构建 Docker 镜像..."
-docker build -t $IMAGE_NAME .
+screen -dmS nexus bash -c "nexus-network start --node-id \$NODE_ID &>> /root/nexus.log"
 
-# 移除已有容器
-if docker ps -a --format '{{.Names}}' | grep -Eq "^$CONTAINER_NAME\$"; then
-    echo "🧹 移除旧容器..."
-    docker rm -f $CONTAINER_NAME
+sleep 3
+
+if screen -list | grep -q "nexus"; then
+    echo "节点已在后台启动。"
+else
+    echo "节点启动失败，请检查日志："
+    cat /root/nexus.log
+    exit 1
 fi
 
-# 启动新容器
-echo "🚀 启动新节点容器..."
-docker run -d --name $CONTAINER_NAME --restart unless-stopped $IMAGE_NAME
+tail -f /root/nexus.log
+EOF
 
-# 提示
-echo "✅ 节点容器已启动，请稍等片刻后通过以下命令查看日志："
-echo "   docker logs -f $CONTAINER_NAME"
+    docker build -t "$IMAGE_NAME" .
+
+    cd - >/dev/null
+    rm -rf "$WORKDIR"
+}
+
+# 启动容器
+function run_container() {
+    if docker ps -a --format '{{.Names}}' | grep -qw "$CONTAINER_NAME"; then
+        echo "检测到旧容器 $CONTAINER_NAME，正在删除..."
+        docker rm -f "$CONTAINER_NAME"
+    fi
+
+    [ ! -f "$LOG_FILE" ] && touch "$LOG_FILE" && chmod 644 "$LOG_FILE"
+
+    docker run -d \
+        --name "$CONTAINER_NAME" \
+        -e NODE_ID="$NODE_ID" \
+        -v "$LOG_FILE":/root/nexus.log \
+        "$IMAGE_NAME"
+
+    sleep 2
+    if docker logs "$CONTAINER_NAME" | grep -q "节点已在后台启动"; then
+        echo "节点已成功启动，日志路径：$LOG_FILE"
+    else
+        echo "容器启动失败，日志如下："
+        docker logs "$CONTAINER_NAME"
+    fi
+}
+
+# 卸载函数
+function uninstall_node() {
+    echo "停止并删除容器 $CONTAINER_NAME..."
+    docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+
+    echo "删除镜像 $IMAGE_NAME..."
+    docker rmi "$IMAGE_NAME" 2>/dev/null || true
+
+    [ -f "$LOG_FILE" ] && rm -f "$LOG_FILE"
+
+    echo "节点已完全卸载。"
+}
+
+# 主菜单
+while true; do
+    clear
+    echo "脚本由哈哈哈哈编写，推特 @ferdie_jhovie，免费开源，请勿相信收费"
+    echo "========== Nexus 节点管理 =========="
+    echo "1. 安装并启动节点"
+    echo "2. 显示节点 ID"
+    echo "3. 停止并卸载节点"
+    echo "4. 查看节点日志"
+    echo "5. 退出"
+    echo "==================================="
+
+    read -rp "请输入选项(1-5): " choice
+
+    case $choice in
+        1)
+            check_docker
+            read -rp "请输入您的 node-id: " NODE_ID
+            if [ -z "$NODE_ID" ]; then
+                echo "node-id 不能为空，请重新选择。"
+                read -p "按任意键继续"
+                continue
+            fi
+            echo "开始构建镜像并启动容器..."
+            build_image
+            run_container
+            read -p "按任意键返回菜单"
+            ;;
+        2)
+            if docker ps -a --format '{{.Names}}' | grep -qw "$CONTAINER_NAME"; then
+                echo "节点 ID:"
+                docker exec "$CONTAINER_NAME" cat /root/.nexus/node-id || echo "无法读取节点 ID"
+            else
+                echo "容器未运行，请先安装并启动节点（选项1）"
+            fi
+            read -p "按任意键返回菜单"
+            ;;
+        3)
+            uninstall_node
+            read -p "按任意键返回菜单"
+            ;;
+        4)
+            if docker ps --format '{{.Names}}' | grep -qw "$CONTAINER_NAME"; then
+                echo "查看日志，按 Ctrl+C 退出日志查看"
+                docker logs -f "$CONTAINER_NAME"
+            else
+                echo "容器未运行，请先安装并启动节点（选项1）"
+                read -p "按任意键返回菜单"
+            fi
+            ;;
+        5)
+            echo "退出脚本。"
+            exit 0
+            ;;
+        *)
+            echo "无效选项，请重新输入。"
+            read -p "按任意键返回菜单"
+            ;;
+    esac
+done
